@@ -1,14 +1,17 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from './auth/auth.module';
-import { RabbitMQModule } from './queues/rabbimq.module'; // Import RabbitMQModule
-import { AppController } from './app.controller';
+import { CustomersModule } from './customers/customer.module';
+import { OrdersModule } from './orders/order.module';
+import { QueuesModule } from './queues/queues.module';
+import { PrismaModule } from './prisma/prisma.module';
 
 @Module({
   imports: [
     AuthModule,
-    RabbitMQModule, // Add RabbitMQModule to imports
+    CustomersModule,
+    OrdersModule,
+    QueuesModule,
+    PrismaModule,
   ],
-  controllers: [AppController], // Move AppController here
-  providers: [], // Remove AppController from providers
 })
 export class AppModule {}
