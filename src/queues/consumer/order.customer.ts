@@ -18,8 +18,13 @@ export class OrderConsumer {
     const exchange = 'crm-exchange';
     const routingKey = 'order.created';
 
-    // Bind queue to exchange
-    await this.rabbitMQ.bindQueue(queue, exchange, routingKey);
+    // Bind queue to exchange with queue options
+    await this.rabbitMQ.bindQueue(
+      queue,
+      routingKey,  // routingKey comes second
+      { durable: true }  // queueOptions comes third
+      // exchange is already set in RabbitMQService
+    );
 
     // Start consuming
     await this.rabbitMQ.consume(queue, async (message) => {

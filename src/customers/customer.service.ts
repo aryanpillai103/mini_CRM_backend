@@ -9,10 +9,12 @@ export class CustomersService {
   async create(createCustomerDto: CreateCustomerDto) {
     // Publish to RabbitMQ for async processing
     await this.rabbitMQService.publish(
-      'crm-exchange',
-      'customer.created',
-      createCustomerDto,
+      'customer.created', // routingKey
+      createCustomerDto,  // message
+      undefined,         // options (optional)
+      'crm-exchange'     // exchange (optional, as it's already set in RabbitMQService)
     );
+    
     return { status: 'Customer creation queued', data: createCustomerDto };
   }
 }

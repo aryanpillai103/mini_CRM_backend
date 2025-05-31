@@ -24,7 +24,8 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
     username: this.getEnvVariable('RABBITMQ_USERNAME', 'guest'),
     password: this.getEnvVariable('RABBITMQ_PASSWORD', 'guest'),
     vhost: this.getEnvVariable('RABBITMQ_VHOST', '/'),
-    heartbeat: 30
+    heartbeat: 30,
+    frameMax: 8192
   };
 
   private readonly retryOptions = {
@@ -69,28 +70,36 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private async initializeConnection(): Promise<void> {
-    let attempt = 0;
-    let delay = this.retryOptions.initialDelay;
+private async initializeConnection(): Promise<void> {
+  let attempt = 0;
+  let delay = this.retryOptions.initialDelay;
 
-    while (attempt < this.retryOptions.maxAttempts && !this.isShuttingDown) {
-      attempt++;
-      try {
-        await this.connect();
-        this.isInitialized = true;
-        this.emitter.emit('ready');
-        this.logger.log(`Connected to RabbitMQ (exchange: ${this.exchangeName}, type: ${this.exchangeType})`);
-        return;
-      } catch (error) {
-        this.logger.error(`Connection attempt ${attempt} failed: ${error.message}`);
-        if (attempt >= this.retryOptions.maxAttempts) {
-          throw new Error(`Failed after ${attempt} attempts. Last error: ${error.message}`);
-        }
-        delay = Math.min(delay * this.retryOptions.factor, this.retryOptions.maxDelay);
-        await setTimeout(delay);
+  while (attempt < this.retryOptions.maxAttempts && !this.isShuttingDown) {
+    attempt++;
+    try {
+      await this.connect();
+      this.isInitialized = true;
+      this.emitter.emit('ready');
+      this.logger.log(`Connected to RabbitMQ (exchange: ${this.exchangeName}, type: ${this.exchangeType})`);
+      return;
+    } catch (error) {
+      // Specific handling for exchange conflicts
+      if (error.message.includes('PRECONDITION_FAILED') && 
+          error.message.includes('inequivalent arg')) {
+        this.logger.error(`Exchange configuration mismatch detected. Attempting resolution...`);
+        await this.handleExchangeConflict();
+        continue; // Skip the delay and retry immediately
       }
+      
+      this.logger.error(`Connection attempt ${attempt} failed: ${error.message}`);
+      if (attempt >= this.retryOptions.maxAttempts) {
+        throw new Error(`Failed after ${attempt} attempts. Last error: ${error.message}`);
+      }
+      delay = Math.min(delay * this.retryOptions.factor, this.retryOptions.maxDelay);
+      await setTimeout(delay);
     }
   }
+}
 
   private async connect(): Promise<void> {
     await this.cleanupExistingConnection();
@@ -130,38 +139,95 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private async setupExchange(): Promise<void> {
-    try {
+private async setupExchange(): Promise<void> {
+  try {
+    // First try to get the existing exchange info
+    const checkExchange = await this.channel.checkExchange(this.exchangeName);
+    this.logger.debug(`Exchange exists: ${JSON.stringify(checkExchange)}`);
+    
+    // If we get here, the exchange exists - now assert with correct params
+    await this.channel.assertExchange(this.exchangeName, this.exchangeType, {
+      durable: true,
+      alternateExchange: 'amq.direct'
+    });
+  } catch (err) {
+    if (err.code === 404) {
+      // Exchange doesn't exist - create it fresh
+      this.logger.log(`Creating new exchange ${this.exchangeName} of type ${this.exchangeType}`);
       await this.channel.assertExchange(this.exchangeName, this.exchangeType, {
         durable: true,
         alternateExchange: 'amq.direct'
       });
-    } catch (err) {
-      if (err.code === 406) { // PRECONDITION_FAILED
-        this.logger.warn(`Exchange ${this.exchangeName} exists with different parameters`);
-        await this.handleExchangeConflict();
-      } else {
-        throw err;
-      }
+    } else if (err.code === 406) {
+      // Parameter mismatch - handle conflict
+      await this.handleExchangeConflict();
+    } else {
+      throw err;
     }
+  }
+}
+
+private async handleExchangeConflict(): Promise<void> {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(`Production exchange conflict for ${this.exchangeName}. Manual intervention required.`);
   }
 
-  private async handleExchangeConflict(): Promise<void> {
-    if (process.env.NODE_ENV === 'production') {
-      this.logger.warn('Using existing exchange with potentially different parameters');
-      return;
+  this.logger.warn(`Attempting to resolve exchange conflict for ${this.exchangeName}`);
+  
+  try {
+    // Step 1: Unbind all queues from this exchange
+    const bindings = await this.getExchangeBindings();
+    for (const binding of bindings) {
+      await this.channel.unbindQueue(
+        binding.queue, 
+        this.exchangeName, 
+        binding.routingKey,
+        binding.args
+      );
     }
-    
-    // For development - delete and recreate
-    try {
-      await this.channel.deleteExchange(this.exchangeName);
-      this.logger.log(`Deleted conflicting exchange ${this.exchangeName}`);
-      await this.setupExchange();
-    } catch (deleteErr) {
-      this.logger.error(`Failed to resolve exchange conflict: ${deleteErr.message}`);
-      throw deleteErr;
+
+    // Step 2: Delete the exchange
+    await this.channel.deleteExchange(this.exchangeName);
+    this.logger.log(`Successfully deleted conflicting exchange ${this.exchangeName}`);
+
+    // Step 3: Recreate with correct parameters
+    await this.channel.assertExchange(this.exchangeName, this.exchangeType, {
+      durable: true,
+      alternateExchange: 'amq.direct'
+    });
+    this.logger.log(`Successfully recreated exchange ${this.exchangeName} as type ${this.exchangeType}`);
+
+    // Step 4: Rebind all queues
+    for (const binding of bindings) {
+      await this.channel.bindQueue(
+        binding.queue,
+        this.exchangeName,
+        binding.routingKey,
+        binding.args
+      );
     }
+  } catch (error) {
+    this.logger.error(`Failed to resolve exchange conflict: ${error.message}`);
+    throw new Error(`Cannot reconcile exchange parameters. Please check RabbitMQ manually.`);
   }
+}
+
+private async getExchangeBindings(): Promise<any[]> {
+  // This requires RabbitMQ management plugin enabled
+  const managementApiUrl = `http://${this.connectionOptions.hostname}:15672/api/bindings/${encodeURIComponent(this.connectionOptions.vhost)}`;
+  const auth = Buffer.from(`${this.connectionOptions.username}:${this.connectionOptions.password}`).toString('base64');
+  
+  try {
+    const response = await fetch(managementApiUrl, {
+      headers: { 'Authorization': `Basic ${auth}` }
+    });
+    const allBindings = await response.json();
+    return allBindings.filter(b => b.source === this.exchangeName);
+  } catch (error) {
+    this.logger.warn(`Could not fetch bindings from management API: ${error.message}`);
+    return [];
+  }
+}
 
   private async handleConnectionLoss(): Promise<void> {
     if (this.isShuttingDown) return;

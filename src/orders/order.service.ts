@@ -14,9 +14,10 @@ export class OrdersService {
     };
 
     await this.rabbitMQService.publish(
-      'crm-exchange',
-      'order.created',
-      orderData,
+      'order.created', // routingKey first
+      orderData,       // message second
+      undefined,       // options (optional)
+      'crm-exchange'   // exchange (optional)
     );
 
     return {
