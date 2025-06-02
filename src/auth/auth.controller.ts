@@ -1,9 +1,13 @@
-import { Controller, Get, Req, UseGuards } from '@nestjs/common';
+/* eslint-disable */
+import { Controller, Get, Post, Req, UseGuards, Body } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
-import { AuthenticatedRequest } from './auth.interface'; // Adjust the import path
+import { AuthenticatedRequest } from './auth.interface';
+import { AuthService } from './auth.service';
 
 @Controller('auth')
 export class AuthController {
+  constructor(private readonly authService: AuthService) {} // Add this constructor
+
   @Get('google')
   @UseGuards(AuthGuard('google'))
   googleLogin() {
@@ -26,10 +30,14 @@ export class AuthController {
   logout(@Req() req: AuthenticatedRequest) {
     req.logout((err) => {
       if (err) {
-        // Handle error if needed
         console.error('Logout error:', err);
       }
     });
     return { message: 'Logged out successfully' };
+  }
+
+  @Post('google')
+  async googleAuth(@Body() body: { token: string }) {
+    return this.authService.googleLogin(body.token);
   }
 }
